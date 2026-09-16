@@ -1,0 +1,9 @@
+# Generated telemetry reports
+race_telemetry/runs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Windows alternate data streams accidentally copied into WSL
+*:Zone.Identifier
