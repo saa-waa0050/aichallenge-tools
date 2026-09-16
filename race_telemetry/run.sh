@@ -1,21 +1,11 @@
 #!/usr/bin/env bash
 # Race telemetry launcher for an existing aichallenge-racingkart installation.
-# This repository is intentionally independent from the official challenge repo.
+# Independent from the official challenge repository.
 
 set -u
 set -o pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-# Usage:
-#   bash run.sh
-#   bash run.sh /path/to/aichallenge-racingkart
-#
-# Override with environment variables if desired:
-#   AICHALLENGE_REPO=/path/to/repo
-#   TELEMETRY_BASE_SPEED=35
-#   TELEMETRY_SAMPLE_HZ=20
-#   TELEMETRY_ROS_DOMAIN_ID=1
 
 AICHALLENGE_DIR="${1:-${AICHALLENGE_REPO:-$HOME/aichallenge-racingkart}}"
 BASE_SPEED="${TELEMETRY_BASE_SPEED:-32}"
@@ -76,20 +66,20 @@ echo "[telemetry] Preparing recorder..."
 CONTAINER_SCRIPT="/tmp/aichallenge_race_telemetry.py"
 CONTAINER_OUT="/tmp/aichallenge_telemetry_runs"
 CONTAINER_PID="/tmp/aichallenge_race_telemetry.pid"
+CONTAINER_LOG="/tmp/aichallenge_race_telemetry.log"
 HOST_OUT="${SCRIPT_DIR}/runs"
 
-docker exec "${CID}" bash -lc "rm -rf '${CONTAINER_OUT}'; mkdir -p '${CONTAINER_OUT}'"
+docker exec "${CID}" bash -lc "
+    rm -rf '${CONTAINER_OUT}'
+    mkdir -p '${CONTAINER_OUT}'
+    rm -f '${CONTAINER_PID}' '${CONTAINER_LOG}'
+"
 docker cp "${SCRIPT_DIR}/race_telemetry.py" "${CID}:${CONTAINER_SCRIPT}" >/dev/null
 
-echo "[telemetry] Recorder started."
-echo "[telemetry] Run the simulation normally."
-echo "[telemetry] When the run is finished, press Ctrl+C HERE to save the report."
-echo
-
-# Start the recorder in the container. The shell writes its PID and then execs
-# Python, so the PID file becomes the Python PID.
-docker exec "${CID}" bash -lc "
-    set -e
+# Launch detached from the host terminal. This is intentional:
+# Ctrl+C should stop the recorder inside the container, not kill docker exec
+# before the HTML report has finished being written.
+docker exec -d "${CID}" bash -lc "
     source /opt/ros/humble/setup.bash
     source /aichallenge/workspace/install/setup.bash
     export ROS_DOMAIN_ID='${ROS_DOMAIN_ID_VALUE}'
@@ -97,26 +87,80 @@ docker exec "${CID}" bash -lc "
     exec python3 '${CONTAINER_SCRIPT}' \
         --base-speed '${BASE_SPEED}' \
         --sample-hz '${SAMPLE_HZ}' \
-        --out '${CONTAINER_OUT}'
-" &
-EXEC_PID=$!
+        --out '${CONTAINER_OUT}' \
+        > '${CONTAINER_LOG}' 2>&1
+"
+
+# Wait briefly for PID file.
+for _ in $(seq 1 50); do
+    if docker exec "${CID}" test -s "${CONTAINER_PID}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+echo "[telemetry] Recorder started."
+echo "[telemetry] Run the simulation normally."
+echo "[telemetry] When the run is finished, press Ctrl+C HERE to save the report."
+echo
+
+STOP_REQUESTED=0
+
+recorder_alive() {
+    docker exec "${CID}" bash -lc "
+        test -s '${CONTAINER_PID}' &&
+        kill -0 \"\$(cat '${CONTAINER_PID}')\" 2>/dev/null
+    " >/dev/null 2>&1
+}
 
 stop_recorder() {
+    if [[ "${STOP_REQUESTED}" -eq 1 ]]; then
+        return
+    fi
+    STOP_REQUESTED=1
+
+    # Ignore repeated Ctrl+C while we let Python finish CSV + HTML generation.
+    trap '' INT TERM
+
     echo
     echo "[telemetry] Stopping recorder cleanly..."
     docker exec "${CID}" bash -lc "
-        if [[ -f '${CONTAINER_PID}' ]]; then
+        if test -s '${CONTAINER_PID}'; then
             kill -INT \"\$(cat '${CONTAINER_PID}')\" 2>/dev/null || true
+        fi
+    " >/dev/null 2>&1 || true
+
+    echo "[telemetry] Waiting for CSV/HTML generation to finish..."
+
+    # Give Python up to 20 seconds to finish report generation.
+    for _ in $(seq 1 200); do
+        if ! recorder_alive; then
+            return
+        fi
+        sleep 0.1
+    done
+
+    echo "[telemetry] Recorder did not exit within 20 s; forcing termination."
+    docker exec "${CID}" bash -lc "
+        if test -s '${CONTAINER_PID}'; then
+            kill -TERM \"\$(cat '${CONTAINER_PID}')\" 2>/dev/null || true
         fi
     " >/dev/null 2>&1 || true
 }
 
 trap stop_recorder INT TERM
 
-wait "${EXEC_PID}"
-EXEC_RC=$?
+# Keep this host process alive while the detached recorder runs.
+while recorder_alive; do
+    sleep 0.25
+done
 
 trap - INT TERM
+
+echo
+if docker exec "${CID}" test -f "${CONTAINER_LOG}" 2>/dev/null; then
+    docker exec "${CID}" cat "${CONTAINER_LOG}" 2>/dev/null || true
+fi
 
 mkdir -p "${HOST_OUT}"
 
@@ -127,20 +171,19 @@ if docker inspect "${CID}" >/dev/null 2>&1; then
         echo "[telemetry] Report copied to this tools repository."
         if [[ -n "${LATEST}" ]]; then
             echo "  ${LATEST}"
-            if [[ -f "${LATEST}/telemetry.html" ]]; then
-                echo "  HTML: ${LATEST}/telemetry.html"
+            [[ -f "${LATEST}/telemetry.csv" ]] && echo "  CSV : ${LATEST}/telemetry.csv"
+            [[ -f "${LATEST}/telemetry.html" ]] && echo "  HTML: ${LATEST}/telemetry.html"
+
+            if [[ ! -f "${LATEST}/telemetry.html" ]]; then
+                echo "[telemetry] WARNING: telemetry.html was not generated."
+                exit 1
             fi
         fi
     else
         echo "[telemetry] Could not copy the report from the container."
+        exit 1
     fi
 else
     echo "[telemetry] Autoware container disappeared before the report could be copied."
+    exit 1
 fi
-
-# Ctrl+C commonly makes docker exec return 130 even though the recorder saved
-# correctly. Treat that as a normal interactive stop.
-if [[ "${EXEC_RC}" -eq 130 ]]; then
-    exit 0
-fi
-exit "${EXEC_RC}"
